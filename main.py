@@ -17,9 +17,10 @@ import websockets
 
 from config       import SIGNAL_HOST, SIGNAL_PORT, MAX_DAILY_LOSS, SYMBOLS
 from logger       import log, log_section
-from connection   import connect_executor
+from connection   import connect_executor, fetch_balance
 from trade_engine import check_contract
 import martingale as mg
+import stats
 
 
 # ── Global state ──────────────────────────────────────────────────────
@@ -27,32 +28,9 @@ ws_global       = None
 active_trade    = None
 pending_signal  = None   # accepted signal, waiting for active_trade to clear
 incoming_signal = None   # raw arrival, evaluated by engine on next tick
-balance         = 0.0    # refreshed on connect + heartbeat
+balance         = "0.00 USD"   # always a live string from fetch_balance()
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  BALANCE FETCH
-# ═══════════════════════════════════════════════════════════════════════
-
-async def fetch_balance(ws) -> float:
-    """Fetches account balance from Deriv. Returns 0.0 on failure."""
-    try:
-        await ws.send(json.dumps({"balance": 1, "subscribe": 0}))
-        deadline = asyncio.get_running_loop().time() + 10
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return 0.0
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            msg = json.loads(raw)
-            if "balance" in msg:
-                return float(msg["balance"].get("balance", 0))
-            if "error" in msg:
-                log(f"⚠️  Balance error: {msg['error']['message']}")
-                return 0.0
-    except Exception as e:
-        log(f"⚠️  fetch_balance failed: {e}")
-        return 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -104,7 +82,7 @@ async def engine():
             if not ws_global:
                 ws_global = await connect_executor()
                 balance   = await fetch_balance(ws_global)
-                log(f"💰 Balance: ${round(balance, 2)}")
+                log(f"💰 Balance: ${balance}")
 
                 # Verify active trade after reconnect
                 if active_trade and active_trade.get("cid"):
@@ -193,8 +171,6 @@ async def engine():
                     log("   Trend     : HIGH VOLATILITY | 3 levels max")
                 else:
                     log("   Trend     : NORMAL | 5 levels max")
-                log(f"   Balance   : ${round(balance, 2)}")
-
                 active_trade = mg.make_trade(signal)
                 log(f"🟢 Cycle started → {active_trade['symbol']}")
 
@@ -204,14 +180,14 @@ async def engine():
 
                 if result == "WIN":
                     balance = await fetch_balance(ws_global)
-                    log(f"💰 Balance after WIN: ${round(balance, 2)}")
+                    log(f"💰 Balance: ${balance}")
                     active_trade = None
                     if pending_signal:
                         log("🔄 Picking up pending signal after WIN")
 
                 elif result == "EXHAUSTED":
                     balance        = await fetch_balance(ws_global)
-                    log(f"💰 Balance after cycle: ${round(balance, 2)}")
+                    log(f"💰 Balance: ${balance}")
                     active_trade   = None
                     pending_signal = None
 
@@ -250,10 +226,12 @@ async def heartbeat():
 
         log_section("HEARTBEAT")
         log(f"   Status      : {status}")
-        log(f"   Balance     : ${round(balance, 2)}")
+        log(f"   Balance     : ${balance}")
         log(f"   Daily loss  : ${round(mg.daily_loss, 2)} / ${MAX_DAILY_LOSS}")
         log(f"   Trade       : {trade_info}")
         log(f"   Pending     : {pending_signal['symbol'] if pending_signal else 'none'}")
+        for line in stats.summary():
+            log(line)
 
 
 # ═══════════════════════════════════════════════════════════════════════

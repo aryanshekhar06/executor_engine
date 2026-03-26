@@ -21,6 +21,7 @@ from logger       import log, log_section
 from trade_engine import place_trade, check_contract
 from strategy     import resolve_direction, get_stake
 from connection   import fetch_balance
+import stats
 from config       import (MAX_LEVELS, LAST_WINDOW_SECS, MAX_DAILY_LOSS,
                           TIMEFRAME, WS_URL, API_TOKEN)
 
@@ -35,44 +36,27 @@ EARLY_WIN_THRESHOLD  =  0.5
 
 def _calc_indicators(candles: list, period: int = 14) -> tuple:
     """
-    Exact TradingView ADX (Wilder, period=14) implementation.
-
-    Matches TradingView's ADX indicator precisely:
-    - TR  = max(high-low, |high-prevClose|, |low-prevClose|)
-    - +DM = upMove   if upMove > downMove and upMove > 0 else 0
-    - -DM = downMove if downMove > upMove and downMove > 0 else 0
-    - Seed  = simple SUM of first `period` bars
-    - Smooth = Wilder's: val = val - val/period + new
-    - First ADX = simple average of first `period` DX values
-    - Then Wilder smooth remaining DX values
-
-    Returns (adx, plus_di, minus_di, current_price, ema50)
-    Always returns 5 values.
+    Exact TradingView ADX (Wilder, period=14).
+    Returns (adx, plus_di, minus_di, current_price, ema50, ema9, adx_prev, di_spread_prev)
+    Always returns 8 values.
     """
     if len(candles) < period * 2:
-        return 0, 0, 0, 0.0, 0.0
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0, 0
 
     highs  = [float(c["high"])  for c in candles]
     lows   = [float(c["low"])   for c in candles]
     closes = [float(c["close"]) for c in candles]
 
-    # ── Step 1: TR, +DM, -DM per bar ──────────────────────────────────
     tr_list, pdm_list, mdm_list = [], [], []
     for i in range(1, len(candles)):
         h, l, ph, pl, pc = highs[i], lows[i], highs[i-1], lows[i-1], closes[i-1]
-
         tr   = max(h - l, abs(h - pc), abs(l - pc))
-        up   = h  - ph   # how much higher than previous high
-        down = pl - l    # how much lower than previous low
-
-        pdm  = up   if up   > down and up   > 0 else 0.0
-        mdm  = down if down > up   and down > 0 else 0.0
-
+        up   = h  - ph
+        down = pl - l
+        pdm_list.append(up   if up   > down and up   > 0 else 0.0)
+        mdm_list.append(down if down > up   and down > 0 else 0.0)
         tr_list.append(tr)
-        pdm_list.append(pdm)
-        mdm_list.append(mdm)
 
-    # ── Step 2: Seed with simple SUM of first `period` bars ───────────
     atr  = sum(tr_list[:period])
     pdm_ = sum(pdm_list[:period])
     mdm_ = sum(mdm_list[:period])
@@ -84,40 +68,68 @@ def _calc_indicators(candles: list, period: int = 14) -> tuple:
         s   = pdi + mdi
         return 100.0 * abs(pdi - mdi) / s if s else 0.0
 
-    # ── Step 3: Collect DX values with Wilder smoothing ───────────────
-    dx_list = [_dx(atr, pdm_, mdm_)]   # first DX from seed
+    dx_list = [_dx(atr, pdm_, mdm_)]
+
+    # Store previous values for adx_prev and di_spread_prev
+    prev_atr  = atr
+    prev_pdm_ = pdm_
+    prev_mdm_ = mdm_
 
     for i in range(period, len(tr_list)):
+        prev_atr  = atr
+        prev_pdm_ = pdm_
+        prev_mdm_ = mdm_
         atr  = atr  - atr  / period + tr_list[i]
         pdm_ = pdm_ - pdm_ / period + pdm_list[i]
         mdm_ = mdm_ - mdm_ / period + mdm_list[i]
         dx_list.append(_dx(atr, pdm_, mdm_))
 
     if len(dx_list) < period:
-        return 0, 0, 0, 0.0, 0.0
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0, 0
 
-    # ── Step 4: ADX = average of first `period` DX, then Wilder smooth
     adx = sum(dx_list[:period]) / period
     for dx in dx_list[period:]:
         adx = (adx * (period - 1) + dx) / period
 
+    # adx_prev: ADX without last data point
+    adx_prev_val = sum(dx_list[:period]) / period
+    for dx in dx_list[period:-1]:
+        adx_prev_val = (adx_prev_val * (period - 1) + dx) / period
+
     plus_di  = int(round(100.0 * pdm_ / atr)) if atr else 0
     minus_di = int(round(100.0 * mdm_ / atr)) if atr else 0
 
-    # ── EMA50 ──────────────────────────────────────────────────────────
+    # Previous DI spread
+    prev_plus_di  = int(round(100.0 * prev_pdm_ / prev_atr)) if prev_atr else 0
+    prev_minus_di = int(round(100.0 * prev_mdm_ / prev_atr)) if prev_atr else 0
+    di_spread_prev = abs(prev_plus_di - prev_minus_di)
+
+    # EMA50
     ema_period = 50
     if len(closes) >= ema_period:
-        ema = sum(closes[:ema_period]) / ema_period
-        k   = 2.0 / (ema_period + 1)
+        ema50 = sum(closes[:ema_period]) / ema_period
+        k50   = 2.0 / (ema_period + 1)
         for price in closes[ema_period:]:
-            ema = (price - ema) * k + ema
-        ema50 = round(ema, 5)
+            ema50 = (price - ema50) * k50 + ema50
+        ema50 = round(ema50, 5)
     else:
         ema50 = round(sum(closes) / len(closes), 5)
 
+    # EMA9
+    ema9_period = 9
+    if len(closes) >= ema9_period:
+        ema9 = sum(closes[:ema9_period]) / ema9_period
+        k9   = 2.0 / (ema9_period + 1)
+        for price in closes[ema9_period:]:
+            ema9 = (price - ema9) * k9 + ema9
+        ema9 = round(ema9, 5)
+    else:
+        ema9 = round(closes[-1], 5)
+
     current_price = closes[-1]
 
-    return int(round(adx)), plus_di, minus_di, current_price, ema50
+    return (int(round(adx)), plus_di, minus_di, current_price,
+            ema50, ema9, int(round(adx_prev_val)), di_spread_prev)
 
 
 async def _fetch_fresh_indicators(symbol: str) -> tuple:
@@ -142,14 +154,14 @@ async def _fetch_fresh_indicators(symbol: str) -> tuple:
         raw  = await asyncio.wait_for(ws.recv(), timeout=10)
         data = json.loads(raw)
         if "error" in data:
-            return 0, 0, 0, 0.0, 0.0
+            return 0, 0, 0, 0.0, 0.0, 0.0, 0, 0
         raw_candles = data.get("candles", [])
         # Exclude last candle — it is still forming (mid-candle)
         # TradingView uses closed candles only — this makes values match
         closed_candles = raw_candles[:-1] if len(raw_candles) > 1 else raw_candles
         return _calc_indicators(closed_candles)
     except Exception:
-        return 0, 0, 0, 0.0, 0.0
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0, 0
     finally:
         if ws:
             try:
@@ -291,6 +303,7 @@ async def _advance_level(ws, trade: dict) -> str:
     if next_level >= trade["max_levels"]:
         log("💀 Max levels reached → Reset")
         record_loss(trade["total_staked"])
+        stats.record_loss(trade["total_staked"], trade["level"])
         return "EXHAUSTED"
 
     log(f"   Next stake      : ${get_stake(next_level)}")
@@ -358,6 +371,7 @@ async def process_trade(ws, trade: dict) -> str:
             log(f"   Total staked : ${round(trade['total_staked'], 2)}")
             log(f"   Net gain     : +${round(profit - trade['buy_price'], 2)}")
             log(f"   Balance      : {bal}")
+            stats.record_win(profit, trade["level"], trade["total_staked"], was_early=False)
             return "WIN"
 
         # Confirmed LOSS
@@ -383,6 +397,7 @@ async def process_trade(ws, trade: dict) -> str:
                         f"| {trade['symbol']}")
             log(f"   Floating     : ${round(floating, 2)}  (< {EARLY_LOSS_THRESHOLD})")
             log(f"   Balance      : {bal}")
+            stats.record_early_loss()
             return await _advance_level(ws, trade)
 
         # Zone 2: -0.5 ≤ floating ≤ 0.5 → wait
@@ -396,6 +411,7 @@ async def process_trade(ws, trade: dict) -> str:
                         f"| {trade['symbol']}")
             log(f"   Floating     : +${round(floating, 2)}  (> {EARLY_WIN_THRESHOLD})")
             log(f"   Balance      : {bal}")
+            stats.record_win(profit, trade["level"], trade["total_staked"], was_early=False)
             return "WIN"
 
     return "OPEN"

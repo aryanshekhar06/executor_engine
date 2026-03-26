@@ -36,44 +36,27 @@ _lock               = asyncio.Lock()
 
 def _calc_indicators(candles: list, period: int = 14) -> tuple:
     """
-    Exact TradingView ADX (Wilder, period=14) implementation.
-
-    Matches TradingView's ADX indicator precisely:
-    - TR  = max(high-low, |high-prevClose|, |low-prevClose|)
-    - +DM = upMove   if upMove > downMove and upMove > 0 else 0
-    - -DM = downMove if downMove > upMove and downMove > 0 else 0
-    - Seed  = simple SUM of first `period` bars
-    - Smooth = Wilder's: val = val - val/period + new
-    - First ADX = simple average of first `period` DX values
-    - Then Wilder smooth remaining DX values
-
-    Returns (adx, plus_di, minus_di, current_price, ema50)
-    Always returns 5 values.
+    Exact TradingView ADX (Wilder, period=14).
+    Returns (adx, plus_di, minus_di, current_price, ema50, ema9, adx_prev, di_spread_prev)
+    Always returns 8 values.
     """
     if len(candles) < period * 2:
-        return 0, 0, 0, 0.0, 0.0
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0, 0
 
     highs  = [float(c["high"])  for c in candles]
     lows   = [float(c["low"])   for c in candles]
     closes = [float(c["close"]) for c in candles]
 
-    # ── Step 1: TR, +DM, -DM per bar ──────────────────────────────────
     tr_list, pdm_list, mdm_list = [], [], []
     for i in range(1, len(candles)):
         h, l, ph, pl, pc = highs[i], lows[i], highs[i-1], lows[i-1], closes[i-1]
-
         tr   = max(h - l, abs(h - pc), abs(l - pc))
-        up   = h  - ph   # how much higher than previous high
-        down = pl - l    # how much lower than previous low
-
-        pdm  = up   if up   > down and up   > 0 else 0.0
-        mdm  = down if down > up   and down > 0 else 0.0
-
+        up   = h  - ph
+        down = pl - l
+        pdm_list.append(up   if up   > down and up   > 0 else 0.0)
+        mdm_list.append(down if down > up   and down > 0 else 0.0)
         tr_list.append(tr)
-        pdm_list.append(pdm)
-        mdm_list.append(mdm)
 
-    # ── Step 2: Seed with simple SUM of first `period` bars ───────────
     atr  = sum(tr_list[:period])
     pdm_ = sum(pdm_list[:period])
     mdm_ = sum(mdm_list[:period])
@@ -85,41 +68,68 @@ def _calc_indicators(candles: list, period: int = 14) -> tuple:
         s   = pdi + mdi
         return 100.0 * abs(pdi - mdi) / s if s else 0.0
 
-    # ── Step 3: Collect DX values with Wilder smoothing ───────────────
-    dx_list = [_dx(atr, pdm_, mdm_)]   # first DX from seed
+    dx_list = [_dx(atr, pdm_, mdm_)]
+
+    # Store previous values for adx_prev and di_spread_prev
+    prev_atr  = atr
+    prev_pdm_ = pdm_
+    prev_mdm_ = mdm_
 
     for i in range(period, len(tr_list)):
+        prev_atr  = atr
+        prev_pdm_ = pdm_
+        prev_mdm_ = mdm_
         atr  = atr  - atr  / period + tr_list[i]
         pdm_ = pdm_ - pdm_ / period + pdm_list[i]
         mdm_ = mdm_ - mdm_ / period + mdm_list[i]
         dx_list.append(_dx(atr, pdm_, mdm_))
 
     if len(dx_list) < period:
-        return 0, 0, 0, 0.0, 0.0
+        return 0, 0, 0, 0.0, 0.0, 0.0, 0, 0
 
-    # ── Step 4: ADX = average of first `period` DX, then Wilder smooth
     adx = sum(dx_list[:period]) / period
     for dx in dx_list[period:]:
         adx = (adx * (period - 1) + dx) / period
 
+    # adx_prev: ADX without last data point
+    adx_prev_val = sum(dx_list[:period]) / period
+    for dx in dx_list[period:-1]:
+        adx_prev_val = (adx_prev_val * (period - 1) + dx) / period
+
     plus_di  = int(round(100.0 * pdm_ / atr)) if atr else 0
     minus_di = int(round(100.0 * mdm_ / atr)) if atr else 0
 
-    # ── EMA50 ──────────────────────────────────────────────────────────
+    # Previous DI spread
+    prev_plus_di  = int(round(100.0 * prev_pdm_ / prev_atr)) if prev_atr else 0
+    prev_minus_di = int(round(100.0 * prev_mdm_ / prev_atr)) if prev_atr else 0
+    di_spread_prev = abs(prev_plus_di - prev_minus_di)
+
+    # EMA50
     ema_period = 50
     if len(closes) >= ema_period:
-        ema = sum(closes[:ema_period]) / ema_period
-        k   = 2.0 / (ema_period + 1)
+        ema50 = sum(closes[:ema_period]) / ema_period
+        k50   = 2.0 / (ema_period + 1)
         for price in closes[ema_period:]:
-            ema = (price - ema) * k + ema
-        ema50 = round(ema, 5)
+            ema50 = (price - ema50) * k50 + ema50
+        ema50 = round(ema50, 5)
     else:
         ema50 = round(sum(closes) / len(closes), 5)
 
+    # EMA9
+    ema9_period = 9
+    if len(closes) >= ema9_period:
+        ema9 = sum(closes[:ema9_period]) / ema9_period
+        k9   = 2.0 / (ema9_period + 1)
+        for price in closes[ema9_period:]:
+            ema9 = (price - ema9) * k9 + ema9
+        ema9 = round(ema9, 5)
+    else:
+        ema9 = round(closes[-1], 5)
+
     current_price = closes[-1]
 
-    return int(round(adx)), plus_di, minus_di, current_price, ema50
-
+    return (int(round(adx)), plus_di, minus_di, current_price,
+            ema50, ema9, int(round(adx_prev_val)), di_spread_prev)
 
 
 async def _fetch_symbol_data(symbol: str, direction: str) -> dict:
@@ -172,22 +182,25 @@ async def _fetch_symbol_data(symbol: str, direction: str) -> dict:
                     log(f"⚠️  {symbol}: API error — {msg['error']['message']}")
                     break
 
-        adx, plus_di, minus_di, current_price, ema50 = _calc_indicators(candles_data or [])
+        adx, plus_di, minus_di, current_price, ema50, ema9, adx_prev, di_spread_prev = _calc_indicators(candles_data or [])
         return {
-            "adx":           adx,
-            "plus_di":       plus_di,
-            "minus_di":      minus_di,
-            "di_spread":     abs(plus_di - minus_di),
-            "payout_ratio":  payout_ratio,
-            "current_price": current_price,
-            "ema50":         ema50,
+            "adx":            adx,
+            "plus_di":        plus_di,
+            "minus_di":       minus_di,
+            "di_spread":      abs(plus_di - minus_di),
+            "payout_ratio":   payout_ratio,
+            "current_price":  current_price,
+            "ema50":          ema50,
+            "ema9":           ema9,
+            "adx_prev":       adx_prev,
+            "di_spread_prev": di_spread_prev,
         }
 
     except Exception as e:
         log(f"⚠️  market_selector: fetch failed ({symbol}): {e}")
-        return {"adx": 0, "plus_di": 0, "minus_di": 0,
-                "di_spread": 0, "payout_ratio": 0.0,
-                "current_price": 0.0, "ema50": 0.0}
+        return {"adx": 0, "plus_di": 0, "minus_di": 0, "di_spread": 0,
+                "payout_ratio": 0.0, "current_price": 0.0, "ema50": 0.0,
+                "ema9": 0.0, "adx_prev": 0, "di_spread_prev": 0}
 
 
 
@@ -238,6 +251,9 @@ async def _select_and_send():
         payout           = data["payout_ratio"]
         current_price    = data.get("current_price", 0.0)
         ema50            = data.get("ema50", 0.0)
+        ema9             = data.get("ema9", 0.0)
+        adx_prev         = data.get("adx_prev", 0)
+        di_spread_prev   = data.get("di_spread_prev", 0)
 
         # Check 1: Payout filter
         if payout > 0 and payout < PAYOUT_MIN_RATIO:
@@ -250,7 +266,9 @@ async def _select_and_send():
         # Check 2: ADX/strategy filter — resolve direction now
         direction, max_levels, mode = resolve_direction(
             signal_direction, adx, plus_di, minus_di,
-            current_price=current_price, ema50=ema50
+            current_price=current_price, ema50=ema50,
+            ema9=ema9, adx_prev=adx_prev,
+            di_spread_prev=di_spread_prev
         )
 
         if direction is None:
@@ -277,6 +295,9 @@ async def _select_and_send():
             "payout_ratio":     payout,
             "current_price":    current_price,
             "ema50":            ema50,
+            "ema9":             ema9,
+            "adx_prev":         adx_prev,
+            "di_spread_prev":   di_spread_prev,
             "max_levels":       max_levels,
         })
 
@@ -309,6 +330,9 @@ async def _select_and_send():
         "di_spread":        best["di_spread"],
         "current_price":    best["current_price"],
         "ema50":            best["ema50"],
+        "ema9":             best.get("ema9", 0.0),
+        "adx_prev":         best.get("adx_prev", 0),
+        "di_spread_prev":   best.get("di_spread_prev", 0),
     }
     await send_payload(payload)
 
