@@ -16,6 +16,10 @@
 #  ADX PERIOD: 14 candles × 15 min = 3.5 hours
 # ═══════════════════════════════════════════════════════════════════════
 
+
+
+
+
 from config import MARTINGALE_STAKES, MAX_LEVELS
 
 ADX_NO_TRADE  = 20
